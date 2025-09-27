@@ -6,8 +6,8 @@ import numpy as np
 # ===============================
 # 📁 CONFIGURATION
 # ===============================
-INPUT_DIR = "ORIGINAL_IMAGE"
-OUTPUT_DIR = "ocr_output"
+INPUT_DIR = "Testcase_final"
+OUTPUT_DIR = "submission"
 USE_GPU = True
 
 # ===============================
@@ -48,10 +48,10 @@ def select_alpha_by_stats(gray):
         return 0.7
     # Very dark: slightly increase contrast
     if mean < 80 and dark_ratio > 0.02:
-        return 1.15
+        return 1.25
     # Low contrast, mid-tone: slightly increase contrast
     if std < 35 and 80 <= mean <= 170:
-        return 1.15
+        return 1.25
     # Default: slightly reduce for textured backgrounds
     return 0.9
 
@@ -75,7 +75,7 @@ def preprocess_image(image, min_text_px=13, max_scale=2.5):
 # ===============================
 # 2. OCR & CHUNKING
 # ===============================
-def run_ocr(img_path, reader, chunk_height=1000, overlap=13): # overlap = 1 13 17
+def run_ocr(img_path, reader, chunk_height=1000, overlap=1): # overlap = 1 13 17
     """Processes an image by chunking and preprocessing each chunk."""
     full_image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if full_image is None:
@@ -111,6 +111,11 @@ def process_folder(input_dir, output_dir, reader):
             if file.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
                 input_path = os.path.join(root, file)
                 rel_path = os.path.relpath(root, input_dir)
+                
+                # Convert images_<name> to texts_<name>
+                if rel_path.startswith("images_"):
+                    rel_path = rel_path.replace("images_", "texts_", 1)
+                
                 output_folder = os.path.join(output_dir, rel_path)
                 os.makedirs(output_folder, exist_ok=True)
                 base_name, _ = os.path.splitext(file) 
@@ -135,13 +140,13 @@ if __name__ == "__main__":
     print(f"📁 Output folder: {OUTPUT_DIR}")
 
     # Uncomment the line below to process the entire folder
-    # process_folder(INPUT_DIR, OUTPUT_DIR, reader)
+    process_folder(INPUT_DIR, OUTPUT_DIR, reader)
 
-    # Run a single image for testing
-    text = run_ocr("ORIGINAL_IMAGE/images_hyecho/TJP201654_01.jpg", reader)
-    output_path = "ocr_result.txt"
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(text))
-    print(f"OCR result saved to: {output_path}")
+    # # Run a single image for testing
+    # text = run_ocr("ORIGINAL_IMAGE/images_hyecho/TJP201654_01.jpg", reader)
+    # output_path = "ocr_result.txt"
+    # with open(output_path, "w", encoding="utf-8") as f:
+    #     f.write("\n".join(text))
+    # print(f"OCR result saved to: {output_path}")
 
     print("✅ OCR processing complete!")

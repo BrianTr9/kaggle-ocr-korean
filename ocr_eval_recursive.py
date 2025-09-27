@@ -6,7 +6,7 @@ from pathlib import Path
 
 # === CONFIG ===
 GROUND_TRUTH_DIR = Path("ORIGINAL_TEXT")  # path to your GT folder
-OCR_DIR = Path("ocr_output")              # path to your OCR folder
+OCR_DIR = Path("submission")              # path to your OCR folder
 RESULTS_FILE = Path("evaluation_results.txt")  # where to save the results
 MAX_WORKERS = 32  # ⬅️ run up to 10 processes at the same time
 
