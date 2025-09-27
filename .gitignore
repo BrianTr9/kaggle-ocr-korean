@@ -1,6 +1,7 @@
 # Ignore original images and OCR output directories
 ORIGINAL_IMAGE/
 ocr_output/
+submission/
 
 # Python cache files
 __pycache__/
