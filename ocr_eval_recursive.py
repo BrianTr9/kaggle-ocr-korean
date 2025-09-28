@@ -15,7 +15,11 @@ tasks = []  # (rel_path:str, gt_path:Path, ocr_path:Path)
 
 for gt_path in GROUND_TRUTH_DIR.rglob("*.txt.text"):
     rel_path = gt_path.relative_to(GROUND_TRUTH_DIR)
-    ocr_path = OCR_DIR / rel_path
+    
+    # The OCR file has a .txt extension, not .txt.text, so we remove the final suffix.
+    ocr_rel_path = rel_path.with_suffix('')
+    ocr_path = OCR_DIR / ocr_rel_path
+    
     if not ocr_path.exists():
         print(f"⚠️ Missing OCR output for: {rel_path}")
         continue

@@ -2,6 +2,7 @@
 ORIGINAL_IMAGE/
 ocr_output/
 submission/
+TEST_FOR_PHASE1/
 
 # Python cache files
 __pycache__/

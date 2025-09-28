@@ -6,7 +6,7 @@ import numpy as np
 # ===============================
 # 📁 CONFIGURATION
 # ===============================
-INPUT_DIR = "Testcase_final"
+INPUT_DIR = "TEST_FOR_PHASE1"
 OUTPUT_DIR = "submission"
 USE_GPU = True
 
@@ -119,7 +119,7 @@ def process_folder(input_dir, output_dir, reader):
                 output_folder = os.path.join(output_dir, rel_path)
                 os.makedirs(output_folder, exist_ok=True)
                 base_name, _ = os.path.splitext(file) 
-                output_path = os.path.join(output_folder, f"{base_name}.txt.text")
+                output_path = os.path.join(output_folder, f"{base_name}.txt")
 
                 print(f"🔍 OCR: {input_path} -> {output_path}")
                 try:
@@ -135,7 +135,7 @@ def process_folder(input_dir, output_dir, reader):
 if __name__ == "__main__":
     print("🚀 Initializing EasyOCR Reader...")
     reader = easyocr.Reader(['ko', 'en'], gpu=USE_GPU)
-
+    # reader = easyocr.Reader(['ko', 'en'], gpu=USE_GPU, recog_network='korean_g2')
     print(f"📂 Input folder:  {INPUT_DIR}")
     print(f"📁 Output folder: {OUTPUT_DIR}")
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     process_folder(INPUT_DIR, OUTPUT_DIR, reader)
 
     # # Run a single image for testing
-    # text = run_ocr("ORIGINAL_IMAGE/images_hyecho/TJP201654_01.jpg", reader)
+    # text = run_ocr("ORIGINAL_IMAGE/images_hyecho/TCA20184_01.jpg", reader)
     # output_path = "ocr_result.txt"
     # with open(output_path, "w", encoding="utf-8") as f:
     #     f.write("\n".join(text))
