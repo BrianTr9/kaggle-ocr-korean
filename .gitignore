@@ -1,8 +1,8 @@
 # Ignore original images and OCR output directories
 ORIGINAL_IMAGE/
-ocr_output/
 submission/
 TEST_FOR_PHASE1/
+otherVersion/
 
 # Python cache files
 __pycache__/
