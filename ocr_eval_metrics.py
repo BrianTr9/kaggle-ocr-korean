@@ -76,7 +76,6 @@ def main():
     total_ocr_lines = 0
     total_line_aligned = 0
 
-    # For precision/recall estimates at char-level using S/D/I; substitutions impact correctness but not lengths
     sum_char_S = 0
     sum_char_D = 0
     sum_char_I = 0
@@ -102,7 +101,6 @@ def main():
     accuracy = 1.0 - cer
 
     # Char-level precision/recall/F1 (estimated)
-    # Using GT = C + S + D and OCR = C + S + I => C_est from GT side
     char_correct_est = max(0, total_gt_chars - sum_char_S - sum_char_D)
     char_recall = safe_div(char_correct_est, total_gt_chars)
     char_precision = safe_div(char_correct_est, total_ocr_chars)
@@ -113,9 +111,17 @@ def main():
     line_precision = safe_div(total_line_aligned, total_ocr_lines)
     line_f1 = safe_div(2 * line_precision * line_recall, (line_precision + line_recall)) if (line_precision + line_recall) else 0.0
 
+    # ==========================================================
+    # PHẦN BỔ SUNG: TÍNH OVERALL SCORE
+    # ==========================================================
+    # Sử dụng Trung bình nhân để cân bằng giữa độ chính xác ký tự và cấu trúc dòng
+    overall_score = (accuracy * line_f1) ** 0.5
+
     # ---- Report ----
     print("📊 Overall OCR Evaluation Summary")
     print("=====================================")
+    
+    
     print(f"Blocks parsed:                {file_count}")
     print("")
     print("Character-level (micro)")
@@ -135,6 +141,12 @@ def main():
     print(f"  Precision:                  {line_precision*100:.2f}%")
     print(f"  Recall:                     {line_recall*100:.2f}%")
     print(f"  F1:                         {line_f1*100:.2f}%")
+    
+    print("-------------------------------------")
+      # ---- HIỂN THỊ OVERALL SCORE ----
+    print(f"🏆 Overall Score (Balanced):     {overall_score*100:.2f}")
+    print("   (Calculated as sqrt(Char Accuracy * Line F1))")
+    print("-------------------------------------")
 
 
 if __name__ == "__main__":

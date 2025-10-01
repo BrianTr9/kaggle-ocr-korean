@@ -45,15 +45,15 @@ def select_alpha_by_stats(gray):
     mean, std, bright_ratio, dark_ratio = image_stats(gray)
     # Very bright or glare: reduce contrast
     if mean > 200 or bright_ratio > 0.02:
-        return 0.7
+        return 0.80
     # Very dark: slightly increase contrast
     if mean < 80 and dark_ratio > 0.02:
-        return 1.25
+        return 1.35
     # Low contrast, mid-tone: slightly increase contrast
     if std < 35 and 80 <= mean <= 170:
-        return 1.25
-    # Default: slightly reduce for textured backgrounds
-    return 0.9
+        return 1.20
+    # Default:
+    return 1.0
 
 def preprocess_image(image, min_text_px=13, max_scale=2.5):
     """Preprocessing function calling the optimized estimator."""
@@ -75,7 +75,7 @@ def preprocess_image(image, min_text_px=13, max_scale=2.5):
 # ===============================
 # 2. OCR & CHUNKING
 # ===============================
-def run_ocr(img_path, reader, chunk_height=1000, overlap=1): # overlap = 1 13 17
+def run_ocr(img_path, reader, chunk_height=900, overlap=1): # overlap = 1 13 17
     """Processes an image by chunking and preprocessing each chunk."""
     full_image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if full_image is None:
