@@ -12,6 +12,7 @@ from typing import Optional, Tuple, List
 import cv2
 import easyocr
 import numpy as np
+from difflib import SequenceMatcher
 
 
 # ===============================
@@ -25,15 +26,24 @@ class OCRConfig:
     input_dir: str = "TEST_FOR_PHASE1"
     output_dir: str = "submission"
     use_gpu: bool = True
+
+    # Debug & Logging Controls
+    enable_debug_images: bool = True   # Generate debug chunk images 
+    enable_verbose_logging: bool = True  # Show preprocessing details
+    debug_images_dir: str = "debug_chunks"  # Directory for debug images
     
+    # Chunking
+    chunk_height: int = 900
+    overlap: int = 20 # Set 1 if no deduplicate needed
+    
+    # Deduplication
+    enable_deduplication: bool = True  # Default off to preserve baseline evaluation
+    lcs_threshold: float = 0.40
+
     # Text Size & Scaling
     min_text_px: int = 18
     max_scale: float = 3.5
     max_dimension: int = 3000
-    
-    # Chunking
-    chunk_height: int = 900
-    overlap: int = 1
     
     # Text Detection Thresholds
     min_text_height: int = 8
@@ -52,11 +62,12 @@ class OCRConfig:
     
     # Preprocessing
     noise_std_threshold: int = 60
-    sharpening_std_threshold: int = 50
+    sharpening_std_threshold: int = 60
     
     # OCR
     confidence_threshold: float = 0.085
     languages: List[str] = None
+    
     
     def __post_init__(self):
         if self.languages is None:
@@ -199,8 +210,12 @@ class ImagePreprocessor:
         self.config = config
         self.analyzer = ImageAnalyzer(config)
     
-    def preprocess(self, image: np.ndarray, verbose: bool = True) -> np.ndarray:
+    def preprocess(self, image: np.ndarray, verbose: bool = None) -> np.ndarray:
         """Apply full preprocessing pipeline"""
+        # Use config setting if verbose not explicitly provided
+        if verbose is None:
+            verbose = self.config.enable_verbose_logging
+            
         image = self.analyzer.validate_image(image)
         if image is None:
             return image
@@ -306,13 +321,23 @@ class OCRProcessor:
     def initialize_reader(self):
         """Initialize EasyOCR reader"""
         print("🚀 Initializing EasyOCR Reader...")
-        self.reader = easyocr.Reader(
-            self.config.languages, 
-            gpu=self.config.use_gpu
-        )
+        try:
+            self.reader = easyocr.Reader(
+                self.config.languages,
+                gpu=self.config.use_gpu
+            )
+        except Exception as e:
+            # Fallback to CPU mode if GPU initialization fails
+            print(f"⚠️ EasyOCR initialization failed with gpu={self.config.use_gpu}: {e}")
+            if self.config.use_gpu:
+                print("ℹ️ Falling back to CPU mode for EasyOCR reader")
+            self.reader = easyocr.Reader(
+                self.config.languages,
+                gpu=False
+            )
     
     def process_image(self, img_path: str) -> List[str]:
-        """Process a single image with chunking"""
+        """Process image with Y-coordinate based LCS deduplication"""
         full_image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         
         if full_image is None:
@@ -320,12 +345,16 @@ class OCRProcessor:
             return []
         
         h, _ = full_image.shape
-        all_texts = []
-        all_confidences = []
+        # Store detected text grouped by logical lines to allow safe line-level removal
+        all_lines: List[List[str]] = []  # each entry is a list of text blocks belonging to one visual line
+        all_confidences: List[float] = []  # flat list for global stats
+
+        # Simple approach: track last line of previous chunk
+        prev_last_line = []  # List of texts from last line of previous chunk
+        prev_last_conf = 0.0
         
-        # Process in chunks
-        for y_start, y_end in self._generate_chunks(h):
-            print(f"   - Processing chunk from y={y_start} to y={y_end}")
+        for chunk_idx, (y_start, y_end) in enumerate(self._generate_chunks(h)):
+            print(f"   - Processing chunk {chunk_idx} from y={y_start} to y={y_end}")
             
             chunk = full_image[y_start:y_end, :]
             chunk = self.preprocessor.preprocess(chunk)
@@ -333,16 +362,109 @@ class OCRProcessor:
             # Run OCR
             results = self.reader.readtext(chunk, paragraph=False, detail=1)
             
-            # Filter by confidence
+            # Debug: Save all chunks with bounding boxes (if enabled)
+            if self.config.enable_debug_images:
+                self._save_debug_image(chunk, results, img_path, chunk_idx, self.config.confidence_threshold)
+            
+            # If deduplication is disabled: use baseline flow -> append texts in detection order
+            if not self.config.enable_deduplication:
+                # Preserve previous behaviour (each detection becomes its own line)
+                for bbox, text, conf in results:
+                    all_confidences.append(conf)
+                    if conf >= self.config.confidence_threshold:
+                        all_lines.append([text])
+                continue
+
+            # Extract texts with absolute Y coordinates and confidence filtering (advanced flow)
+            valid_detections = []
             for bbox, text, conf in results:
-                if conf >= self.config.confidence_threshold:
-                    all_texts.append(text)
                 all_confidences.append(conf)
-        
+                if conf >= self.config.confidence_threshold:
+                    # Calculate absolute Y coordinate
+                    y_relative = sum(point[1] for point in bbox) / len(bbox)
+                    y_absolute = y_start + y_relative
+                    valid_detections.append((text, y_absolute, conf))
+
+            if not valid_detections:
+                continue
+
+            # Sort by Y coordinate (top to bottom) and group detections into logical lines
+            valid_detections.sort(key=lambda x: x[1])
+
+            # Group detections into lines (each line: list of (text, y_abs, conf))
+            lines = self._group_detections_into_lines(valid_detections)
+
+            if chunk_idx == 0:
+                # First chunk: add all lines
+                for line in lines:
+                    all_lines.append([t for t, _, _ in line])
+
+                # Store last line texts for next chunk
+                prev_last_line = [t for t, _, _ in lines[-1]] if lines else []
+                prev_last_conf = (sum(c for _, _, c in lines[-1]) / len(lines[-1])) if lines and lines[-1] else 0.0
+            else:
+                # Current first line
+                curr_first = lines[0] if lines else []
+                curr_first_texts = [t for t, _, _ in curr_first]
+                curr_first_conf = (sum(c for _, _, c in curr_first) / len(curr_first)) if curr_first else 0.0
+
+                # Deduplicate using SequenceMatcher-based similarity + confidence
+                action = self._deduplicate_with_lcs(prev_last_line, curr_first_texts, prev_last_conf, curr_first_conf)
+
+                if action == 1:
+                    # Remove last logical line from all_lines
+                    if all_lines:
+                        removed = all_lines.pop()
+                        print(f"      🔄 LCS: Removed prev line ({len(removed)} texts): {removed}")
+
+                elif action == 2:
+                    # Remove first logical line from current chunk (skip adding it)
+                    print(f"      🔄 LCS: Removed curr first line ({len(curr_first_texts)} texts): {curr_first_texts}")
+                    lines = lines[1:]
+
+                # Add remaining logical lines from current chunk
+                for line in lines:
+                    all_lines.append([t for t, _, _ in line])
+
+                # Update last line for next iteration
+                if lines:
+                    prev_last_line = [t for t, _, _ in lines[-1]]
+                    prev_last_conf = (sum(c for _, _, c in lines[-1]) / len(lines[-1])) if lines[-1] else 0.0
+                else:
+                    prev_last_line = []
+                    prev_last_conf = 0.0
+            
         # Display statistics
         self._display_stats(all_confidences)
-        
-        return all_texts
+
+        # Flatten grouped lines to the original output format (one detection per line as before)
+        flattened = [t for line in all_lines for t in line]
+        return flattened
+
+    def _group_detections_into_lines(self, detections: List[Tuple[str, float, float]], tol: float = 5.0):
+        """Group detections (text,y,conf) into logical lines based on Y coordinate proximity.
+
+        Returns list of lines, each line is list of tuples (text, y, conf).
+        """
+        if not detections:
+            return []
+
+        lines = []
+        current_line = [detections[0]]
+        current_y = detections[0][1]
+
+        for text, y_abs, conf in detections[1:]:
+            if abs(y_abs - current_y) <= tol:
+                current_line.append((text, y_abs, conf))
+            else:
+                lines.append(current_line)
+                current_line = [(text, y_abs, conf)]
+                current_y = y_abs
+
+        if current_line:
+            lines.append(current_line)
+
+        return lines
     
     def _generate_chunks(self, image_height: int):
         """Generate chunk boundaries for processing"""
@@ -359,6 +481,127 @@ class OCRProcessor:
             
             y_start += (chunk_height - overlap)
     
+    def _extract_last_line(self, detections):
+        """Extract all texts from the last line (highest Y coordinate)"""
+        if not detections:
+            return []
+        
+        # Find the highest Y coordinate
+        max_y = max(detection[1] for detection in detections)
+        
+        # Get all texts with Y coordinate close to max_y (±5px tolerance)
+        last_line_texts = []
+        for text, y_abs, conf in detections:
+            if abs(y_abs - max_y) <= 5:
+                last_line_texts.append(text)
+        
+        return last_line_texts
+    
+    def _extract_first_line(self, detections):
+        """Extract all texts from the first line (lowest Y coordinate)"""
+        if not detections:
+            return []
+        
+        # Find the lowest Y coordinate
+        min_y = min(detection[1] for detection in detections)
+        
+        # Get all texts with Y coordinate close to min_y (±5px tolerance)
+        first_line_texts = []
+        for text, y_abs, conf in detections:
+            if abs(y_abs - min_y) <= 5:
+                first_line_texts.append(text)
+        
+        return first_line_texts
+    
+    def _deduplicate_with_lcs(self, prev_last_line, curr_first_line, prev_conf: float = 0.0, curr_conf: float = 0.0):
+        """
+        Deduplicate using LCS algorithm
+        
+        Args:
+            prev_last_line: List of texts from last line of previous chunk
+            curr_first_line: List of texts from first line of current chunk
+            
+        Returns:
+            0: No duplicate - keep both lines
+            1: Remove last line from all_texts (prev chunk line is duplicate)
+            2: Remove first line from current chunk (curr chunk line is duplicate)
+        """
+        if not prev_last_line or not curr_first_line:
+            return 0
+        
+        # Concatenate texts from each line with space and normalize
+        prev_line_text = " ".join(prev_last_line).strip()
+        curr_line_text = " ".join(curr_first_line).strip()
+
+        print(f"      ⚖️ Comparing lines:")
+        print(f"         Prev: '{prev_line_text}'")
+        print(f"         Curr: '{curr_line_text}'")
+
+        if not prev_line_text or not curr_line_text:
+            print(f"      ✅ No duplicate found (empty)")
+            return 0
+
+        # Compute similarity ratio using SequenceMatcher (fast, low memory)
+        ratio = SequenceMatcher(None, prev_line_text, curr_line_text).ratio()
+
+        # Combine ratio with confidence information to reduce false removals
+        # Normalize confidence difference into [-1,1]
+        conf_diff = 0.0
+        try:
+            conf_diff = (curr_conf - prev_conf) / (max(prev_conf, curr_conf, 1e-6))
+        except Exception:
+            conf_diff = 0.0
+
+        # Weighted score: prefer similarity but give some weight to confidence difference
+        weighted_score = 0.85 * ratio + 0.15 * (1.0 - max(0.0, -conf_diff))
+
+        print(f"         Sim ratio: {ratio:.3f}, prev_conf={prev_conf:.3f}, curr_conf={curr_conf:.3f}, weighted={weighted_score:.3f} (threshold: {self.config.lcs_threshold})")
+
+        if weighted_score >= self.config.lcs_threshold:
+            # Remove the line with lower average confidence; fall back to shorter length
+            if curr_conf < prev_conf:
+                return 2
+            elif prev_conf < curr_conf:
+                return 1
+            else:
+                # same confidence -> remove shorter (fewer chars)
+                if len(prev_line_text) < len(curr_line_text):
+                    return 1
+                else:
+                    return 2
+
+        print(f"      ✅ No duplicate found")
+        return 0
+    
+    def _longest_common_subsequence_length(self, text1: str, text2: str) -> int:
+        """
+        Calculate the length of the Longest Common Subsequence (LCS) using Dynamic Programming
+        
+        Time complexity: O(m*n) where m, n are lengths of the strings
+        Space complexity: O(m*n)
+        
+        Args:
+            text1: First string
+            text2: Second string
+            
+        Returns:
+            Length of LCS
+        """
+        m, n = len(text1), len(text2)
+        
+        # Create DP table
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        # Fill DP table
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if text1[i-1] == text2[j-1]:
+                    dp[i][j] = dp[i-1][j-1] + 1
+                else:
+                    dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+        
+        return dp[m][n]
+    
     def _display_stats(self, confidences: List[float]):
         """Display confidence statistics"""
         if confidences:
@@ -369,7 +612,52 @@ class OCRProcessor:
                   f"Min={min_conf:.3f}, Max={max_conf:.3f} "
                   f"({len(confidences)} detections)")
         else:
-            print(f"   📊 No text detected in image")
+            print(f"   🌸 No text detected in image")
+    
+    def _save_debug_image(self, chunk: np.ndarray, results: list, img_path: str, chunk_idx: int, confidence_threshold: float):
+        """Save debug image with bounding boxes for all chunks"""
+        import cv2
+        import os
+        
+        # Create debug output directory
+        debug_dir = Path("otherVersion") / self.config.debug_images_dir
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy chunk for drawing
+        debug_img = chunk.copy()
+        if len(debug_img.shape) == 2:  # Convert grayscale to color
+            debug_img = cv2.cvtColor(debug_img, cv2.COLOR_GRAY2BGR)
+        
+        # Draw bounding boxes and text
+        for i, (bbox, text, conf) in enumerate(results):
+            # Convert bbox to integer coordinates
+            pts = np.array(bbox, dtype=np.int32)
+            
+            # Choose color based on confidence
+            if conf >= confidence_threshold:
+                color = (0, 255, 0)  # Green for accepted
+                status = "ACCEPT"
+            else:
+                color = (0, 0, 255)  # Red for rejected
+                status = "REJECT"
+            
+            # Draw bounding box
+            cv2.polylines(debug_img, [pts], True, color, 2)
+            
+            # Draw text info
+            x, y = pts[0]
+            label = f"{i+1}: {text[:10]}... ({conf:.3f}) {status}"
+            
+            # Background for text
+            (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(debug_img, (x, y-text_h-5), (x+text_w, y), color, -1)
+            cv2.putText(debug_img, label, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Save debug image with chunk index
+        img_name = Path(img_path).stem
+        debug_path = debug_dir / f"{img_name}_chunk{chunk_idx:02d}_debug.jpg"
+        cv2.imwrite(str(debug_path), debug_img)
+        print(f"      💾 Debug image saved: {debug_path}")
 
 
 # ===============================
@@ -392,6 +680,10 @@ class BatchProcessor:
         
         # Clear output folder
         self._clear_output_folder(output_path)
+        
+        # Clear debug chunks folder (if debug enabled)
+        if self.config.enable_debug_images:
+            self._clear_debug_folder()
         
         # Initialize OCR reader
         self.ocr_processor.initialize_reader()
@@ -417,6 +709,17 @@ class BatchProcessor:
         
         output_path.mkdir(parents=True, exist_ok=True)
     
+    def _clear_debug_folder(self):
+        """Clear debug chunks folder before processing"""
+        debug_path = Path("otherVersion") / self.config.debug_images_dir
+        if debug_path.exists():
+            print(f"🧹 Clearing debug chunks folder: {debug_path}")
+            try:
+                shutil.rmtree(debug_path)
+                print("✅ Debug chunks folder cleared successfully!")
+            except Exception as e:
+                print(f"❌ Error clearing debug chunks folder: {e}")
+    
     def _process_single_file(self, img_file: Path, input_path: Path, output_path: Path):
         """Process a single image file"""
         # Calculate relative path
@@ -433,7 +736,7 @@ class BatchProcessor:
         output_folder.mkdir(parents=True, exist_ok=True)
         output_file = output_folder / f"{img_file.stem}.txt"
         
-        print(f"🔍 OCR: {img_file} -> {output_file}")
+        print(f" 🎯 OCR: {img_file} -> {output_file}")
         
         try:
             # Process image
