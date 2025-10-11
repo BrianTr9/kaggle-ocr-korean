@@ -34,7 +34,7 @@ class OCRConfig:
     
     # Chunking
     chunk_height: int = 900
-    overlap: int = 20 # Set 1 if no deduplicate needed
+    overlap: int = 15 # Set 1 if no deduplicate needed
     
     # Deduplication
     enable_deduplication: bool = True  # Default off to preserve baseline evaluation
@@ -545,38 +545,6 @@ class OCRProcessor:
             
             y_start += (chunk_height - overlap)
     
-    def _extract_last_line(self, detections):
-        """Extract all texts from the last line (highest Y coordinate)"""
-        if not detections:
-            return []
-        
-        # Find the highest Y coordinate
-        max_y = max(detection[1] for detection in detections)
-        
-        # Get all texts with Y coordinate close to max_y (±5px tolerance)
-        last_line_texts = []
-        for text, y_abs, conf in detections:
-            if abs(y_abs - max_y) <= 5:
-                last_line_texts.append(text)
-        
-        return last_line_texts
-    
-    def _extract_first_line(self, detections):
-        """Extract all texts from the first line (lowest Y coordinate)"""
-        if not detections:
-            return []
-        
-        # Find the lowest Y coordinate
-        min_y = min(detection[1] for detection in detections)
-        
-        # Get all texts with Y coordinate close to min_y (±5px tolerance)
-        first_line_texts = []
-        for text, y_abs, conf in detections:
-            if abs(y_abs - min_y) <= 5:
-                first_line_texts.append(text)
-        
-        return first_line_texts
-    
     def _deduplicate_with_lcs(self, prev_last_line, curr_first_line, prev_conf: float = 0.0, curr_conf: float = 0.0):
         """
         Deduplicate using LCS algorithm
@@ -617,7 +585,7 @@ class OCRProcessor:
             conf_diff = 0.0
 
         # Weighted score: prefer similarity but give some weight to confidence difference
-        weighted_score = 0.85 * ratio + 0.15 * (1.0 - max(0.0, -conf_diff))
+        weighted_score = 0.9 * ratio + 0.1 * (1.0 - max(0.0, -conf_diff))
 
         print(f"         Sim ratio: {ratio:.3f}, prev_conf={prev_conf:.3f}, curr_conf={curr_conf:.3f}, weighted={weighted_score:.3f} (threshold: {self.config.lcs_threshold})")
 
@@ -637,34 +605,7 @@ class OCRProcessor:
         print(f"      ✅ No duplicate found")
         return 0
     
-    def _longest_common_subsequence_length(self, text1: str, text2: str) -> int:
-        """
-        Calculate the length of the Longest Common Subsequence (LCS) using Dynamic Programming
-        
-        Time complexity: O(m*n) where m, n are lengths of the strings
-        Space complexity: O(m*n)
-        
-        Args:
-            text1: First string
-            text2: Second string
-            
-        Returns:
-            Length of LCS
-        """
-        m, n = len(text1), len(text2)
-        
-        # Create DP table
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        
-        # Fill DP table
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if text1[i-1] == text2[j-1]:
-                    dp[i][j] = dp[i-1][j-1] + 1
-                else:
-                    dp[i][j] = max(dp[i-1][j], dp[i][j-1])
-        
-        return dp[m][n]
+    
     
     def _display_stats(self, confidences: List[float]):
         """Display confidence statistics"""
