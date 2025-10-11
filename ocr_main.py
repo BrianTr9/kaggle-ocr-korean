@@ -349,6 +349,9 @@ class OCRProcessor:
         all_lines: List[List[str]] = []  # each entry is a list of text blocks belonging to one visual line
         all_confidences: List[float] = []  # flat list for global stats
 
+    # (no baseline collection here; when deduplication is disabled we
+    # keep the original chunk-by-chunk detection order)
+
         # Simple approach: track last line of previous chunk
         prev_last_line = []  # List of texts from last line of previous chunk
         prev_last_conf = 0.0
@@ -356,8 +359,21 @@ class OCRProcessor:
         for chunk_idx, (y_start, y_end) in enumerate(self._generate_chunks(h)):
             print(f"   - Processing chunk {chunk_idx} from y={y_start} to y={y_end}")
             
+            # Extract original chunk from full image (coords in original image space)
             chunk = full_image[y_start:y_end, :]
-            chunk = self.preprocessor.preprocess(chunk)
+            orig_h, orig_w = chunk.shape[:2]
+
+            # Preprocess may resize the chunk; we need the processed image for OCR
+            proc_chunk = self.preprocessor.preprocess(chunk)
+            proc_h, proc_w = proc_chunk.shape[:2]
+
+            # Compute scale factors to map processed bbox coords back to original chunk coords
+            # Avoid division by zero
+            scale_x = proc_w / orig_w if orig_w and proc_w else 1.0
+            scale_y = proc_h / orig_h if orig_h and proc_h else 1.0
+
+            # Use proc_chunk for OCR
+            chunk = proc_chunk
             
             # Run OCR
             results = self.reader.readtext(chunk, paragraph=False, detail=1)
@@ -370,66 +386,99 @@ class OCRProcessor:
             if not self.config.enable_deduplication:
                 # Preserve previous behaviour (each detection becomes its own line)
                 for bbox, text, conf in results:
-                    all_confidences.append(conf)
-                    if conf >= self.config.confidence_threshold:
+                    # Normalize confidence when possible
+                    try:
+                        conf_val = float(conf)
+                    except Exception:
+                        conf_val = conf
+
+                    all_confidences.append(conf_val)
+                    if conf_val >= self.config.confidence_threshold:
                         all_lines.append([text])
                 continue
 
             # Extract texts with absolute Y coordinates and confidence filtering (advanced flow)
             valid_detections = []
             for bbox, text, conf in results:
-                all_confidences.append(conf)
-                if conf >= self.config.confidence_threshold:
-                    # Calculate absolute Y coordinate
-                    y_relative = sum(point[1] for point in bbox) / len(bbox)
-                    y_absolute = y_start + y_relative
-                    valid_detections.append((text, y_absolute, conf))
+                # Normalize/conf tracking
+                try:
+                    conf_val = float(conf)
+                except Exception:
+                    conf_val = conf
+
+                all_confidences.append(conf_val)
+                if conf_val >= self.config.confidence_threshold:
+                    # Calculate absolute top-left Y and X coordinates
+                    ys_proc = [p[1] for p in bbox]
+                    xs_proc = [p[0] for p in bbox]
+                    # map processed coords back to original chunk coords
+                    y_top_orig = int(min(ys_proc) / scale_y)
+                    x_left_orig = int(min(xs_proc) / scale_x)
+                    y_absolute = y_start + y_top_orig
+                    valid_detections.append((text, y_absolute, x_left_orig, conf_val))
 
             if not valid_detections:
                 continue
 
-            # Sort by Y coordinate (top to bottom) and group detections into logical lines
-            valid_detections.sort(key=lambda x: x[1])
+            # Sort by top-left coordinate: first by Y (top to bottom), then by X (left to right)
+            valid_detections.sort(key=lambda x: (x[1], x[2]))
 
-            # Group detections into lines (each line: list of (text, y_abs, conf))
+            # Group detections into lines (each line: list of (text, y_abs, x_abs, conf))
             lines = self._group_detections_into_lines(valid_detections)
 
             if chunk_idx == 0:
-                # First chunk: add all lines
+                # First chunk: add all lines (ensure left->right within each line)
                 for line in lines:
-                    all_lines.append([t for t, _, _ in line])
+                    # line items are (text, y, x, conf)
+                    line_sorted = sorted(line, key=lambda it: it[2])
+                    all_lines.append([t for t, _, _, _ in line_sorted])
 
                 # Store last line texts for next chunk
-                prev_last_line = [t for t, _, _ in lines[-1]] if lines else []
-                prev_last_conf = (sum(c for _, _, c in lines[-1]) / len(lines[-1])) if lines and lines[-1] else 0.0
+                prev_last_line = [t for t, _, _, _ in lines[-1]] if lines else []
+                prev_last_conf = (sum(c for _, _, _, c in lines[-1]) / len(lines[-1])) if lines and lines[-1] else 0.0
             else:
                 # Current first line
                 curr_first = lines[0] if lines else []
-                curr_first_texts = [t for t, _, _ in curr_first]
-                curr_first_conf = (sum(c for _, _, c in curr_first) / len(curr_first)) if curr_first else 0.0
+                curr_first_texts = [t for t, _, _, _ in curr_first]
+                curr_first_conf = (sum(c for _, _, _, c in curr_first) / len(curr_first)) if curr_first else 0.0
 
-                # Deduplicate using SequenceMatcher-based similarity + confidence
-                action = self._deduplicate_with_lcs(prev_last_line, curr_first_texts, prev_last_conf, curr_first_conf)
+                # Only attempt deduplication if the first line of the current chunk
+                # is within the top overlap region of this chunk. This avoids
+                # removing legitimate lines that are not in the overlapped area.
+                first_line_y = None
+                if curr_first:
+                    # detections in curr_first are tuples (text, y_abs, conf) or (text, y_abs, x_abs, conf)
+                    # y is at index 1 for both shapes
+                    first_line_y = curr_first[0][1]
 
-                if action == 1:
-                    # Remove last logical line from all_lines
-                    if all_lines:
-                        removed = all_lines.pop()
-                        print(f"      🔄 LCS: Removed prev line ({len(removed)} texts): {removed}")
+                if first_line_y is not None and (first_line_y - y_start) <= self.config.overlap:
+                    # Deduplicate using SequenceMatcher-based similarity + confidence
+                    action = self._deduplicate_with_lcs(prev_last_line, curr_first_texts, prev_last_conf, curr_first_conf)
 
-                elif action == 2:
-                    # Remove first logical line from current chunk (skip adding it)
-                    print(f"      🔄 LCS: Removed curr first line ({len(curr_first_texts)} texts): {curr_first_texts}")
-                    lines = lines[1:]
+                    if action == 1:
+                        # Remove last logical line from all_lines
+                        if all_lines:
+                            removed = all_lines.pop()
+                            print(f"      🔄 LCS: Removed prev line ({len(removed)} texts): {removed}")
 
-                # Add remaining logical lines from current chunk
+                    elif action == 2:
+                        # Remove first logical line from current chunk (skip adding it)
+                        print(f"      🔄 LCS: Removed curr first line ({len(curr_first_texts)} texts): {curr_first_texts}")
+                        lines = lines[1:]
+                else:
+                    # Skip deduplication for this chunk (first line not in overlap)
+                    if first_line_y is not None:
+                        print(f"      ℹ️ Skipping dedupe: first line y={first_line_y:.1f} not within top overlap {self.config.overlap}px of chunk starting at {y_start}")
+
+                # Add remaining logical lines from current chunk (preserve left-to-right order)
                 for line in lines:
-                    all_lines.append([t for t, _, _ in line])
+                    line_sorted = sorted(line, key=lambda it: it[2])
+                    all_lines.append([t for t, _, _, _ in line_sorted])
 
                 # Update last line for next iteration
                 if lines:
-                    prev_last_line = [t for t, _, _ in lines[-1]]
-                    prev_last_conf = (sum(c for _, _, c in lines[-1]) / len(lines[-1])) if lines[-1] else 0.0
+                    prev_last_line = [t for t, _, _, _ in lines[-1]]
+                    prev_last_conf = (sum(c for _, _, _, c in lines[-1]) / len(lines[-1])) if lines[-1] else 0.0
                 else:
                     prev_last_line = []
                     prev_last_conf = 0.0
@@ -437,28 +486,43 @@ class OCRProcessor:
         # Display statistics
         self._display_stats(all_confidences)
 
-        # Flatten grouped lines to the original output format (one detection per line as before)
+        # Flatten grouped lines to the original output format (one detection per line)
         flattened = [t for line in all_lines for t in line]
         return flattened
 
-    def _group_detections_into_lines(self, detections: List[Tuple[str, float, float]], tol: float = 5.0):
-        """Group detections (text,y,conf) into logical lines based on Y coordinate proximity.
+    def _group_detections_into_lines(self, detections: List[tuple], tol: float = 5.0):
+        """Group detections into logical lines based on Y coordinate proximity.
 
-        Returns list of lines, each line is list of tuples (text, y, conf).
+        Supports detection tuples of shape (text, y, x, conf) or ((x,y), text, conf) or (text, y, conf).
+
+        Returns list of lines; each line is a list of detection tuples in the original shape.
         """
         if not detections:
             return []
 
+        # Helper to extract Y from different tuple shapes
+        def extract_y(det):
+            if len(det) == 4:
+                return det[1]
+            if len(det) == 3 and isinstance(det[0], tuple):
+                # ( (x,y), text, conf )
+                return det[0][1]
+            if len(det) == 3:
+                # (text, y, conf)
+                return det[1]
+            raise ValueError("Unsupported detection tuple shape")
+
         lines = []
         current_line = [detections[0]]
-        current_y = detections[0][1]
+        current_y = extract_y(detections[0])
 
-        for text, y_abs, conf in detections[1:]:
+        for det in detections[1:]:
+            y_abs = extract_y(det)
             if abs(y_abs - current_y) <= tol:
-                current_line.append((text, y_abs, conf))
+                current_line.append(det)
             else:
                 lines.append(current_line)
-                current_line = [(text, y_abs, conf)]
+                current_line = [det]
                 current_y = y_abs
 
         if current_line:
